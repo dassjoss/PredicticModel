@@ -1,0 +1,163 @@
+import requests
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+import signal
+import sys
+import time
+
+# ============================================================
+# CONFIGURACIÓN: Cambia estos valores para descargar 1 día
+# ============================================================
+# IMPORTANTE: Usa el mes NORMAL (1-12), no base-0
+# Ejemplos:
+#   - 1 de enero 2025   → year=2025, month=1,  day=1
+#   - 1 de octubre 2025 → year=2025, month=10, day=1
+#   - 1 de noviembre 2025 → year=2025, month=11, day=1
+# ============================================================
+symbol = "XAU-USD"          # "XAU-USD" (oro), "XTI-USD" (WTI), "UKOIL" (Brent)
+year = 2025                 # Año
+month = 10                  # Mes normal (1=enero, 10=octubre, 11=noviembre, 12=diciembre)
+day = 1                     # Día del mes
+output_folder = "./datos_segundos"  # Carpeta donde se guarda el CSV
+
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+# Control para detener el proceso limpiamente con Ctrl+C
+stop_requested = False
+
+
+def _signal_handler(signum, frame):
+    global stop_requested
+    print('\nRecibida señal de parada, terminando después de la iteración actual...')
+    stop_requested = True
+
+
+# Registrar handlers para SIGINT/SIGTERM
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+def fetch_and_decode_ticks(year, month0, day, hour, retries=2, timeout=10):
+    url = f"https://jetta.dukascopy.com/v1/ticks/{symbol}/{year}/{month0:02d}/{day:02d}/{hour:02d}"
+    attempt = 0
+    data = None
+
+    while attempt <= retries and not stop_requested:
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code != 200:
+                # No data disponible para esa hora (normal en fines de semana o fuera de horario)
+                return None
+            data = r.json()
+            break
+        except requests.exceptions.Timeout:
+            attempt += 1
+            if attempt <= retries:
+                print(f" Timeout, reintento {attempt}/{retries}...", end='')
+            time.sleep(1)
+            continue
+        except KeyboardInterrupt:
+            # Dejar propagar para que el signal handler pueda gestionar
+            raise
+        except Exception as e:
+            attempt += 1
+            if attempt <= retries:
+                print(f" Error ({e}), reintento {attempt}/{retries}...", end='')
+            time.sleep(1)
+            continue
+
+    if stop_requested or data is None:
+        return None
+
+    # Decodificación
+    initial_ts = data['timestamp']  # Unix ms
+    multiplier = data['multiplier']
+    current_ask = data['ask']
+    current_bid = data['bid']
+    times = data['times']
+    asks_deltas = data['asks']
+    bids_deltas = data['bids']
+    ask_vols = data['askVolumes']
+    bid_vols = data['bidVolumes']
+
+    ticks = []
+    current_time = initial_ts
+    for i in range(len(times)):
+        if i > 0:
+            current_time += times[i]
+        current_ask += asks_deltas[i] * multiplier
+        current_bid += bids_deltas[i] * multiplier
+        ask_vol = ask_vols[i] / 1000000  # Volumen en millones
+        bid_vol = bid_vols[i] / 1000000
+        ticks.append({
+            'timestamp_ms': current_time,
+            'ask': current_ask,
+            'bid': current_bid,
+            'ask_vol': ask_vol,
+            'bid_vol': bid_vol
+        })
+    return pd.DataFrame(ticks)
+
+def aggregate_to_1s_bars(df_ticks):
+    df_ticks['timestamp'] = pd.to_datetime(df_ticks['timestamp_ms'], unit='ms', utc=True)
+    df_ticks.set_index('timestamp', inplace=True)
+
+    # Usar solo BID (como hace la web oficial de Dukascopy)
+    df_resampled = df_ticks['bid'].resample('1s').agg(
+        Open='first',
+        High='max',
+        Low='min',
+        Close='last'
+    )
+    # Volumen: sumar bid_vol por segundo
+    df_vol = df_ticks['bid_vol'].resample('1s').sum().rename('Volume')
+
+    df_bars = pd.concat([df_resampled, df_vol], axis=1).dropna(subset=['Open'])
+    df_bars.reset_index(inplace=True)
+
+    # Formato de timestamp igual al de la web
+    df_bars['UTC'] = df_bars['timestamp'].dt.strftime('%d.%m.%Y %H:%M:%S.%f').str[:-3] + ' UTC'
+    df_bars = df_bars[['UTC', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+    return df_bars
+
+
+# ============================================================
+# DESCARGA DE 1 DÍA
+# ============================================================
+# La API de Dukascopy usa meses base-0 (0=enero, 9=octubre, 10=noviembre)
+# pero tú configuras el mes normal (1-12), así que restamos 1 aquí
+month_api = month - 1
+
+print(f"Descargando {symbol} para {day:02d}/{month:02d}/{year} (día {day} de mes {month})...")
+print(f"URL base: https://jetta.dukascopy.com/v1/ticks/{symbol}/{year}/{month_api:02d}/{day:02d}/HH")
+
+daily_df = pd.DataFrame()
+
+for hour in range(24):
+    if stop_requested:
+        print('\nDetenido por solicitud del usuario.')
+        break
+
+    print(f"  Descargando hora {hour:02d}...", end='')
+    df_hour = fetch_and_decode_ticks(year, month_api, day, hour)
+
+    if df_hour is not None and not df_hour.empty:
+        daily_bars = aggregate_to_1s_bars(df_hour)
+        daily_df = pd.concat([daily_df, daily_bars])
+        print(f" ✓ ({len(df_hour)} ticks → {len(daily_bars)} barras de 1s)")
+    else:
+        print(" (sin datos)")
+
+# Guardar CSV
+if not daily_df.empty:
+    csv_path = f"{output_folder}/{symbol.replace('-', '_')}_{year}-{month:02d}-{day:02d}_1s_bars.csv"
+    daily_df.to_csv(csv_path, index=False)  # Usar coma como separador (default)
+    print(f"\n✓ ¡Guardado! → {csv_path}")
+    print(f"  Total: {len(daily_df)} barras de 1 segundo")
+else:
+    print(f"\n✗ No se encontraron datos para {year}-{month:02d}-{day:02d}")
+
+print("\n¡Proceso completado!")
